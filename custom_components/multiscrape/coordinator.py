@@ -14,7 +14,7 @@ from homeassistant.helpers.update_coordinator import (
     TimestampDataUpdateCoordinator, event)
 from homeassistant.util.dt import utcnow
 
-from .const import DOMAIN, MAX_RETRIES, RETRY_DELAY_SECONDS
+from .const import CONF_MAX_RETRIES, DOMAIN, MAX_RETRIES, RETRY_DELAY_SECONDS
 from .file import LoggingFileManager
 from .http_session import HttpSession
 from .scrape_context import ScrapeContext
@@ -22,7 +22,6 @@ from .scraper import Scraper
 from .util import create_renderer
 
 _LOGGER = logging.getLogger(__name__)
-# we don't want to go with the default 15 seconds defined in helpers/entity_component
 DEFAULT_SCAN_INTERVAL = timedelta(seconds=60)
 
 
@@ -113,6 +112,13 @@ def create_multiscrape_coordinator(
     _LOGGER.debug("%s # Creating coordinator", config_name)
 
     scan_interval = conf.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+    max_retries = conf.get(CONF_MAX_RETRIES, MAX_RETRIES)
+
+    if CONF_MAX_RETRIES in conf and scan_interval != timedelta(seconds=0):
+        _LOGGER.warning(
+            "%s # 'max_retries' has no effect unless scan_interval is 0",
+            config_name,
+        )
 
     return MultiscrapeDataUpdateCoordinator(
         config_name,
@@ -121,6 +127,7 @@ def create_multiscrape_coordinator(
         file_manager,
         scraper,
         scan_interval,
+        max_retries,
     )
 
 
@@ -135,6 +142,7 @@ class MultiscrapeDataUpdateCoordinator(TimestampDataUpdateCoordinator[None]):
         file_manager: LoggingFileManager,
         scraper: Scraper,
         update_interval: timedelta | None,
+        max_retries: int = MAX_RETRIES,
     ):
         """Initialize the coordinator."""
         self._config_name = config_name
@@ -142,9 +150,11 @@ class MultiscrapeDataUpdateCoordinator(TimestampDataUpdateCoordinator[None]):
         self._file_manager = file_manager
         self._scraper = scraper
         self._update_interval = update_interval
+        self._max_retries = max_retries
         self.update_error = False
         self._resource = None
         self._retry_count: int = 0
+        self._retry_unsub: Callable[[], None] | None = None
         self._force_reauth: bool = False
 
         if self._update_interval == timedelta(seconds=0):
@@ -177,6 +187,13 @@ class MultiscrapeDataUpdateCoordinator(TimestampDataUpdateCoordinator[None]):
         """Flag that re-authentication is needed on the next update cycle."""
         self._force_reauth = True
 
+    async def async_shutdown(self) -> None:
+        """Cancel any pending retry timer before shutting down."""
+        if self._retry_unsub is not None:
+            self._retry_unsub()
+            self._retry_unsub = None
+        await super().async_shutdown()
+
     async def _async_update_data(self) -> None:
         await self._prepare_new_run()
 
@@ -202,28 +219,34 @@ class MultiscrapeDataUpdateCoordinator(TimestampDataUpdateCoordinator[None]):
             self._scraper.reset()
             self.update_error = True
             if self._update_interval is None:
-                self._async_unsub_refresh()
                 self._retry_count += 1
-                if self._retry_count <= MAX_RETRIES:
-                    self._unsub_refresh = event.async_track_point_in_utc_time(
+                if self._retry_count <= self._max_retries:
+
+                    async def _handle_retry(_now) -> None:
+                        """Retry callback: request a fresh refresh via the coordinator."""
+                        if self.hass.is_stopping:
+                            return
+                        await self.async_refresh()
+
+                    self._retry_unsub = event.async_track_point_in_utc_time(
                         self.hass,
-                        self._job,
-                        utcnow().replace(microsecond=self._microsecond)
-                        + timedelta(seconds=RETRY_DELAY_SECONDS),
+                        _handle_retry,
+                        utcnow() + timedelta(seconds=RETRY_DELAY_SECONDS),
                     )
                     _LOGGER.warning(
                         "%s # Since updating failed and scan_interval = 0, retry %s of %s will be scheduled in %s seconds",
                         self._config_name,
                         self._retry_count,
-                        MAX_RETRIES,
+                        self._max_retries,
                         RETRY_DELAY_SECONDS,
                     )
                 else:
                     _LOGGER.error(
                         "%s # Updating and %s retries failed and scan_interval = 0, please manually retry with trigger service.",
                         self._config_name,
-                        MAX_RETRIES,
+                        self._max_retries,
                     )
+                    self._retry_count = 0
 
     async def _prepare_new_run(self) -> None:
         _LOGGER.debug(
