@@ -13,6 +13,7 @@ from homeassistant.const import (CONF_AUTHENTICATION, CONF_FORCE_UPDATE,
 from custom_components.multiscrape.const import (CONF_EXTRACT,
                                                  CONF_FORM_VARIABLES,
                                                  CONF_LOG_RESPONSE,
+                                                 CONF_MAX_RETRIES,
                                                  CONF_ON_ERROR_LOG,
                                                  CONF_ON_ERROR_VALUE,
                                                  CONF_ON_ERROR_VALUE_DEFAULT,
@@ -362,7 +363,52 @@ def test_integration_schema_custom_parser():
     })
     assert result[CONF_PARSER] == "html.parser"
 
+# ============================================================================
+# max_retries tests
+# ============================================================================
 
+
+@pytest.mark.unit
+def test_integration_schema_max_retries_optional():
+    """Test that max_retries is optional and not set by default.
+
+    No default is applied at the schema level: create_multiscrape_coordinator
+    distinguishes "not set" (falls back to MAX_RETRIES) from "explicitly set
+    to a value" (used to warn when scan_interval isn't 0).
+    """
+    result = _validate_combined({CONF_RESOURCE: "https://example.com"})
+    assert CONF_MAX_RETRIES not in result
+
+
+@pytest.mark.unit
+def test_integration_schema_max_retries_accepts_zero():
+    """Test that max_retries=0 is valid (disables automatic retry)."""
+    result = _validate_combined({
+        CONF_RESOURCE: "https://example.com",
+        CONF_MAX_RETRIES: 0,
+    })
+    assert result[CONF_MAX_RETRIES] == 0
+
+
+@pytest.mark.unit
+def test_integration_schema_max_retries_accepts_positive_value():
+    """Test that a custom positive max_retries value is accepted."""
+    result = _validate_combined({
+        CONF_RESOURCE: "https://example.com",
+        CONF_MAX_RETRIES: 5,
+    })
+    assert result[CONF_MAX_RETRIES] == 5
+
+
+@pytest.mark.unit
+def test_integration_schema_max_retries_rejects_negative():
+    """Test that negative max_retries values are rejected."""
+    with pytest.raises(vol.Invalid):
+        _validate_combined({
+            CONF_RESOURCE: "https://example.com",
+            CONF_MAX_RETRIES: -1,
+        })
+      
 # ============================================================================
 # SENSOR_SCHEMA / BINARY_SENSOR_SCHEMA / BUTTON_SCHEMA defaults tests
 # ============================================================================
